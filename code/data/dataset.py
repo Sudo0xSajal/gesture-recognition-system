@@ -140,10 +140,23 @@ class CNNDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         lm_path, label = self.samples[idx]
 
-        # Derive image path from landmark path
-        img_path = Path(
-            str(lm_path).replace("landmarks_", "frame_").replace(".json", ".jpg")
-        )
+        # Derive image path from landmark path.
+        # Primary convention:   landmarks_<stem>.json → frame_<stem>.jpg
+        # Fallback: look for any image with the same stem (downloaded datasets
+        # may not use the frame_ prefix convention).
+        stem     = lm_path.stem.replace("landmarks_", "")
+        parent   = lm_path.parent
+        img_path = parent / f"frame_{stem}.jpg"
+
+        if not img_path.exists():
+            # Try same stem with common image extensions
+            found = None
+            for ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
+                candidate = parent / (stem + ext)
+                if candidate.exists():
+                    found = candidate
+                    break
+            img_path = found or img_path   # keep original path as fallback
 
         if img_path.exists():
             img = cv2.imread(str(img_path))
