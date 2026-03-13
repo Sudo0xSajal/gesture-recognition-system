@@ -36,13 +36,11 @@ What this produces
 
 Run
 ---
-    # Custom webcam dataset (collect with collect.sh first):
-    python code/data/preprocess.py --task hgrd
-    python code/data/preprocess.py --task custom
+    # Webcam dataset (collect with collect.sh first):
+    python code/data/preprocess.py
 
     # Downloaded image dataset (images organised by class folder):
-    python code/data/preprocess.py --task hgrd --from-images
-    python code/data/preprocess.py --task both
+    python code/data/preprocess.py --from-images
 """
 
 import json
@@ -57,7 +55,8 @@ import cv2
 from sklearn.model_selection import StratifiedShuffleSplit
 
 from utils.config import (
-    get_dataset_root, DATA_SPLITS, NUM_CLASSES, GESTURE_NAMES,
+    RAW_DATASET_PATH, PREPROCESSED_DATASET_PATH,
+    DATA_SPLITS, NUM_CLASSES, GESTURE_NAMES,
 )
 
 # Supported image extensions for downloaded datasets
@@ -623,9 +622,9 @@ def _build_feature_cache(samples: List[Dict], out_path: Path) -> None:
 # MAIN
 # =============================================================================
 
-def preprocess(task: str, from_images: bool = False) -> None:
-    root = get_dataset_root(task)
-    print(f"\n[Preprocess] Dataset: {task}  root={root}")
+def preprocess(task: str = None, from_images: bool = False) -> None:
+    root = RAW_DATASET_PATH
+    print(f"\n[Preprocess] raw={root}  preprocessed={PREPROCESSED_DATASET_PATH}")
 
     if not root.exists():
         print(f"  [ERROR] Dataset root not found: {root}")
@@ -679,7 +678,7 @@ def preprocess(task: str, from_images: bool = False) -> None:
     train_s, val_s, test_s = _participant_split(samples)
     print(f"\n  Split → train={len(train_s)}  val={len(val_s)}  test={len(test_s)}")
 
-    splits_dir = root / "splits"
+    splits_dir = PREPROCESSED_DATASET_PATH / "splits"
     splits_dir.mkdir(parents=True, exist_ok=True)
 
     # Write split files
@@ -704,25 +703,16 @@ if __name__ == "__main__":
         epilog="""
 Examples
 --------
-  # Custom webcam dataset (collect with collect.sh first):
-  python code/data/preprocess.py --task hgrd
-  python code/data/preprocess.py --task custom
+  # Preprocess the dataset (raw data in dataset/raw/):
+  python code/data/preprocess.py
 
-  # Downloaded image dataset (images in <gesture_id>/ or <gesture_name>/ folders):
-  python code/data/preprocess.py --task hgrd --from-images
-  python code/data/preprocess.py --task both --from-images
-
-  # Preprocess both datasets:
-  python code/data/preprocess.py --task both
+  # Preprocess using raw images (run MediaPipe ingestion first):
+  python code/data/preprocess.py --from-images
 """,
     )
-    ap.add_argument("-t", "--task", required=True,
-                    choices=["hgrd", "custom", "both"])
     ap.add_argument("--from-images", action="store_true",
                     help="Run MediaPipe on raw images to generate landmark JSON files "
                          "before building splits. Use this for internet-downloaded "
                          "datasets that contain images but no landmark files.")
     args = ap.parse_args()
-    tasks = ["hgrd", "custom"] if args.task == "both" else [args.task]
-    for t in tasks:
-        preprocess(t, from_images=args.from_images)
+    preprocess(from_images=args.from_images)

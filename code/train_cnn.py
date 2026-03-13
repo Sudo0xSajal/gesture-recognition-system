@@ -691,9 +691,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="Train CNN gesture model — fully supervised"
     )
-    ap.add_argument("-t", "--task",       required=True,
-                    choices=["hgrd", "custom"],
-                    help="Which dataset to use")
+    ap.add_argument("-t", "--task",       default="gesture",
+                    help="Experiment task label (used in log directory name)")
     ap.add_argument("-e", "--exp-name",   default="exp",
                     help="Experiment name (e.g. exp1)")
     ap.add_argument("-s", "--seed",       type=int,   default=42)

@@ -14,15 +14,15 @@ What it saves per frame
 
 Directory layout
 ----------------
-  <dataset_root>/raw/<participant>/<session>/<gesture_id>/
+  <dataset_root>/<participant>/<session>/<gesture_id>/
       frame_000001.jpg
       landmarks_000001.json
       ...
 
 Run
 ---
-    python code/data/collector.py --task custom --participant p001
-    python code/data/collector.py --task hgrd   --participant p001 --session morning
+    python code/data/collector.py --participant p001
+    python code/data/collector.py --participant p001 --session morning
 
 Keyboard controls
 -----------------
@@ -45,7 +45,7 @@ from datetime import datetime
 
 from utils.config import (
     GESTURE_NAMES, GESTURE_ACTIONS, CAMERA_CONFIG,
-    NUM_CLASSES, get_dataset_root,
+    NUM_CLASSES, RAW_DATASET_PATH,
 )
 
 
@@ -138,13 +138,12 @@ class DataCollector:
 
     Parameters
     ----------
-    task        : 'hgrd' | 'custom' — which dataset to save into
     participant : participant ID string, e.g. 'p001'
     session     : optional session name (default = timestamp)
     """
 
-    def __init__(self, task: str, participant: str, session: str = None):
-        self.root        = get_dataset_root(task)
+    def __init__(self, participant: str, session: str = None):
+        self.root        = RAW_DATASET_PATH
         self.participant = participant
         self.session     = session or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.cur_gid     = 0
@@ -323,12 +322,9 @@ class DataCollector:
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Gesture data collector")
-    ap.add_argument("-t", "--task",        required=True,
-                    choices=["hgrd", "custom"],
-                    help="Dataset: hgrd | custom")
     ap.add_argument("-p", "--participant", required=True,
                     help="Participant ID, e.g. p001")
     ap.add_argument("-s", "--session",     default=None,
                     help="Session name (default: timestamp)")
     args = ap.parse_args()
-    DataCollector(args.task, args.participant, args.session).run()
+    DataCollector(args.participant, args.session).run()
