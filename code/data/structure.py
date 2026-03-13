@@ -3,39 +3,49 @@ code/data/structure.py
 ======================
 AMOS-like Dataset Structurer for the Gesture Recognition System.
 
+Mirrors the scanning, participant-level splitting, and sample-dict conventions
+of ``preprocess.py``, while producing an AMOS-like output directory tree
+instead of split .txt files and .npz caches.
+
 What it does
 ------------
-Walks the canonical raw dataset tree::
+Scans the same dataset roots that ``preprocess.py`` uses:
 
-    <raw_root>/<participant>/<session>/<gesture_id>/
-        frame_000001.jpg
-        landmarks_000001.json
-        ...
+1. **collector.py / webcam dataset** (standard structure)::
 
-and reorganises it into a clean, split-based output tree::
+       <root>/raw/<participant>/<session>/<gesture_id>/
+           frame_000001.jpg
+           landmarks_000001.json
+
+2. **Downloaded / flat image dataset**::
+
+       <root>/<gesture_id>/*.{jpg,jpeg,png}
+       <root>/<gesture_name>/*.{jpg,jpeg,png}
+
+Then produces an AMOS-like output tree::
 
     <output_root>/
     ├── imagesTr/       training frame images
     ├── landmarksTr/    training landmark JSON files
     ├── imagesVa/       validation frame images
     ├── landmarksVa/    validation landmark JSON files
-    ├── imagesTs/       test frame images (images only — labels withheld)
+    ├── imagesTs/       test frame images  (labels withheld)
     ├── landmarksTs/    test landmark JSON files
-    └── dataset.json    metadata (gesture vocabulary, split statistics, file lists)
+    └── dataset.json    metadata (gesture vocabulary, split stats, file lists)
 
-The split is performed at the **participant level** so no participant's frames
-appear in more than one split (no data leakage).  Split ratios come from
-``utils.config.DATA_SPLITS`` (default 70 / 15 / 15).
+The participant-level split uses ``StratifiedShuffleSplit`` (same as
+``preprocess.py``) so every participant's samples stay in exactly one split
+and the split is stratified by each participant's dominant gesture class.
 
 File naming convention in output folders
 -----------------------------------------
-Each copied file is renamed to::
+Each file is renamed to::
 
     <participant>_<session>_<gesture_id>_<original_filename>
 
 e.g. ``p001_morning_0_frame_000001.jpg``
 
-This makes every filename globally unique and self-describing.
+This makes filenames globally unique and self-describing.
 
 Run
 ---
@@ -44,25 +54,23 @@ Run
 
     # Custom paths:
     python code/data/structure.py \\
-        --raw-root  /path/to/dataset/raw \\
+        --root        /path/to/dataset/raw \\
         --output-root /path/to/dataset/structured
 
-    # Copy files instead of moving them:
+    # Copy files instead of moving them (keeps raw dataset intact):
     python code/data/structure.py --copy
-
-    # Reproducible shuffle with a fixed seed:
-    python code/data/structure.py --seed 42
 """
 
 import json
-import os
-import random
 import shutil
 import argparse
 import textwrap
+import numpy as np
 from pathlib import Path
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from sklearn.model_selection import StratifiedShuffleSplit
 
 from utils.config import (
     RAW_DATASET_PATH,
@@ -73,33 +81,26 @@ from utils.config import (
     NUM_CLASSES,
 )
 
-# ---------------------------------------------------------------------------
-# Supported image extensions (matches structure_dataset.py)
-# ---------------------------------------------------------------------------
+# Supported image extensions — matches preprocess.py
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 # =============================================================================
-# HELPERS
+# HELPERS  (aligned with preprocess.py conventions)
 # =============================================================================
 
-def _is_image(path: Path) -> bool:
-    return path.suffix.lower() in _IMAGE_EXTS
-
-
-def _is_landmark_json(path: Path) -> bool:
-    return path.suffix.lower() == ".json" and path.stem.startswith("landmarks_")
-
-
-def _name_to_gesture_id(folder_name: str) -> int | None:
+def _name_to_gesture_id(folder_name: str) -> Optional[int]:
     """
     Map a folder name to a gesture class ID.
 
-    Supports numeric names (``"0"``, ``"00"``, ``"1"``) and canonical
-    gesture-name strings (``"thumb_up"``, ``"Thumb Up"``).
+    Supports:
+      - Numeric folder names: ``"0"``, ``"00"``, ``"1"`` → gesture ID directly
+      - Gesture name folders: ``"thumb_up"``, ``"Thumb Up"`` → matched
+        case-insensitively after stripping underscores, hyphens, and spaces
 
-    Returns ``None`` when no mapping is found.
+    Returns ``None`` if no match is found.
     """
+    # Numeric folder → direct gesture ID
     try:
         gid = int(folder_name)
         if gid in GESTURE_NAMES:
@@ -107,129 +108,251 @@ def _name_to_gesture_id(folder_name: str) -> int | None:
     except ValueError:
         pass
 
+    # Name-based matching (case-insensitive, normalise separators)
     normalized = folder_name.lower().replace("_", " ").replace("-", " ").strip()
     for gid, name in GESTURE_NAMES.items():
-        if normalized == name.lower():
+        if name.lower() == normalized:
             return gid
+
     return None
 
 
 # =============================================================================
-# 1. COLLECT SAMPLES
+# 1. DATASET SCANNER  (mirrors _scan_dataset in preprocess.py)
 # =============================================================================
 
-def collect_samples(raw_root: Path) -> Dict[str, List[Tuple[int, Path, Path | None]]]:
+def _scan_dataset(root: Path) -> List[Dict]:
     """
-    Walk *raw_root* and collect every (gesture_id, frame_path, landmark_path)
-    tuple, grouped by participant.
+    Scan dataset directory for all ``(landmark_path, image_path, gesture_id,
+    participant, session)`` sample dicts.
 
-    Parameters
-    ----------
-    raw_root : path to the raw dataset root (``dataset/raw``)
+    Expected directory structures (same as ``preprocess.py``):
 
-    Returns
-    -------
-    A dict mapping ``participant_id`` → list of
-    ``(gesture_id, frame_path, landmark_path_or_None)`` tuples.
+    **Standard** (collector.py output)::
+
+        <root>/raw/<participant>/<session>/<gesture_id>/
+            frame_000001.jpg
+            landmarks_000001.json
+
+    **Legacy flat**::
+
+        <root>/<gesture_id>/*.json
+
+    Returns a list of sample dicts with keys:
+      ``landmark_path``, ``image_path``, ``gesture_id``,
+      ``participant``, ``session``.
     """
-    samples: Dict[str, List[Tuple[int, Path, Path | None]]] = defaultdict(list)
+    samples = []
+    raw_root = root / "raw"
 
-    if not raw_root.exists():
+    # ── Standard structure from collector.py ──────────────────────────────────
+    if raw_root.exists():
+        for participant in sorted(raw_root.iterdir()):
+            if not participant.is_dir() or participant.name.startswith("."):
+                continue
+            for session in sorted(participant.iterdir()):
+                if not session.is_dir():
+                    continue
+                for gesture_dir in sorted(session.iterdir()):
+                    if not gesture_dir.is_dir():
+                        continue
+                    try:
+                        gid = int(gesture_dir.name)
+                    except ValueError:
+                        continue
+                    if gid not in GESTURE_NAMES:
+                        continue
+                    for lm_path in sorted(gesture_dir.glob("landmarks_*.json")):
+                        img_path = gesture_dir / lm_path.name.replace(
+                            "landmarks_", "frame_").replace(".json", ".jpg")
+                        samples.append({
+                            "landmark_path": lm_path,
+                            "image_path":    img_path if img_path.exists() else None,
+                            "gesture_id":    gid,
+                            "participant":   participant.name,
+                            "session":       session.name,
+                        })
         return samples
 
-    for participant_dir in sorted(raw_root.iterdir()):
-        if not participant_dir.is_dir():
+    # ── Legacy flat structure: <root>/<gesture_id>/*.json ─────────────────────
+    for gesture_dir in sorted(root.iterdir()):
+        if not gesture_dir.is_dir():
             continue
-        participant = participant_dir.name
+        try:
+            gid = int(gesture_dir.name)
+        except ValueError:
+            continue
+        if gid not in GESTURE_NAMES:
+            continue
+        for lm_path in sorted(gesture_dir.glob("*.json")):
+            img_path = lm_path.with_suffix(".jpg")
+            samples.append({
+                "landmark_path": lm_path,
+                "image_path":    img_path if img_path.exists() else None,
+                "gesture_id":    gid,
+                "participant":   "p001",
+                "session":       "default",
+            })
+    return samples
 
-        for session_dir in sorted(participant_dir.iterdir()):
-            if not session_dir.is_dir():
+
+def _scan_image_dataset(root: Path) -> List[Dict]:
+    """
+    Scan a downloaded image dataset that is organised by class folder but may
+    not have landmark JSON files yet.
+
+    Supported layouts (same as ``ingest_image_dataset`` in preprocess.py):
+
+    * ``<root>/raw/<participant>/<session>/<gesture_id>/*.{jpg,png,...}``
+    * ``<root>/<gesture_id>/*.{jpg,png,...}``
+    * ``<root>/<gesture_name>/*.{jpg,png,...}``
+
+    Only images whose companion ``landmarks_<stem>.json`` already exists are
+    returned.  Run ``preprocess.py --from-images`` first to generate the JSON
+    files, then call this script.
+
+    Returns the same sample-dict format as :func:`_scan_dataset`.
+    """
+    samples = []
+    raw_root = root / "raw"
+
+    def _collect_from_gesture_dir(
+        gesture_dir: Path, gid: int, participant: str, session: str
+    ) -> None:
+        for img_path in sorted(gesture_dir.iterdir()):
+            if img_path.suffix.lower() not in _IMAGE_EXTS:
                 continue
-            session = session_dir.name
+            stem = img_path.stem
+            lm_path = gesture_dir / f"landmarks_{stem}.json"
+            if not lm_path.exists():
+                continue
+            frame_path = (
+                img_path if stem.startswith("frame_")
+                else gesture_dir / f"frame_{stem}{img_path.suffix}"
+            )
+            samples.append({
+                "landmark_path": lm_path,
+                "image_path":    frame_path if frame_path.exists() else img_path,
+                "gesture_id":    gid,
+                "participant":   participant,
+                "session":       session,
+            })
 
-            for gesture_dir in sorted(session_dir.iterdir()):
-                if not gesture_dir.is_dir():
+    if raw_root.exists():
+        for participant in sorted(raw_root.iterdir()):
+            if not participant.is_dir() or participant.name.startswith("."):
+                continue
+            for session in sorted(participant.iterdir()):
+                if not session.is_dir():
                     continue
-                gid = _name_to_gesture_id(gesture_dir.name)
-                if gid is None:
-                    continue
+                for gesture_dir in sorted(session.iterdir()):
+                    if not gesture_dir.is_dir():
+                        continue
+                    gid = _name_to_gesture_id(gesture_dir.name)
+                    if gid is None:
+                        continue
+                    _collect_from_gesture_dir(
+                        gesture_dir, gid, participant.name, session.name)
+        if samples:
+            return samples
 
-                def _index(stem: str) -> str:
-                    parts = stem.split("_", 1)
-                    return parts[1] if len(parts) == 2 else stem
-
-                frames = {
-                    _index(p.stem): p
-                    for p in gesture_dir.iterdir()
-                    if _is_image(p) and p.stem.startswith("frame_")
-                }
-                landmarks = {
-                    _index(p.stem): p
-                    for p in gesture_dir.iterdir()
-                    if _is_landmark_json(p)
-                }
-
-                for idx, frame_path in sorted(frames.items()):
-                    lm_path = landmarks.get(idx)
-                    samples[participant].append((gid, frame_path, lm_path))
+    for gesture_dir in sorted(root.iterdir()):
+        if not gesture_dir.is_dir() or gesture_dir.name.startswith("."):
+            continue
+        if gesture_dir.name == "splits":
+            continue
+        gid = _name_to_gesture_id(gesture_dir.name)
+        if gid is None:
+            continue
+        _collect_from_gesture_dir(gesture_dir, gid, "p001", "default")
 
     return samples
 
 
 # =============================================================================
-# 2. SPLIT PARTICIPANTS
+# 2. PARTICIPANT-LEVEL SPLIT  (mirrors _participant_split in preprocess.py)
 # =============================================================================
 
-def split_participants(
-    samples: Dict[str, List],
-    train_ratio: float,
-    val_ratio: float,
-    seed: int,
-) -> Tuple[List[str], List[str], List[str]]:
+def _participant_split(
+    samples: List[Dict],
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
-    Divide participants into train / val / test lists.
+    Split at participant level so no participant appears in more than one split.
 
-    The split is deterministic given the same *seed* and participant list.
-    All ratios are respected as closely as possible; any rounding remainder
-    goes to train.
+    This prevents data leakage: the model cannot memorise a specific person's
+    hand shape and must generalise to unseen participants.
 
-    Parameters
-    ----------
-    samples     : dict returned by :func:`collect_samples`
-    train_ratio : fraction of participants for training
-    val_ratio   : fraction of participants for validation
-    seed        : random seed for reproducibility
+    Strategy (identical to ``preprocess.py``):
+      1. Compute each participant's dominant gesture class.
+      2. Use ``StratifiedShuffleSplit`` to divide participants into
+         train+val vs test (stratified by dominant gesture).
+      3. Repeat for train vs val within the train+val pool.
+      4. Assign all samples from each participant to the corresponding split.
 
-    Returns
-    -------
-    (train_participants, val_participants, test_participants) — three lists of
-    participant ID strings.
+    Falls back to sample-level split when fewer than 3 participants are present.
+
+    Returns ``(train_samples, val_samples, test_samples)``.
     """
-    participants = sorted(samples.keys())
-    rng = random.Random(seed)
-    rng.shuffle(participants)
+    by_participant: Dict[str, List[Dict]] = defaultdict(list)
+    for s in samples:
+        by_participant[s["participant"]].append(s)
 
-    n = len(participants)
-    n_val   = max(1, round(n * val_ratio)) if n >= 3 else 0
-    n_test  = max(1, round(n * (1.0 - train_ratio - val_ratio))) if n >= 3 else 0
-    n_train = n - n_val - n_test
+    participants = list(by_participant.keys())
 
-    train_ps = participants[:n_train]
-    val_ps   = participants[n_train:n_train + n_val]
-    test_ps  = participants[n_train + n_val:]
+    # Fewer than 3 participants → sample-level fallback
+    if len(participants) < 3:
+        print("  [WARN] Fewer than 3 participants — using sample-level split.")
+        rng  = np.random.default_rng(42)
+        idx  = rng.permutation(len(samples))
+        n    = len(samples)
+        n_tr = int(n * DATA_SPLITS["train_ratio"])
+        n_va = int(n * DATA_SPLITS["val_ratio"])
+        return (
+            [samples[i] for i in idx[:n_tr]],
+            [samples[i] for i in idx[n_tr:n_tr + n_va]],
+            [samples[i] for i in idx[n_tr + n_va:]],
+        )
 
-    return train_ps, val_ps, test_ps
+    # Dominant gesture per participant for stratification
+    p_labels = []
+    for p in participants:
+        counts: Dict[int, int] = defaultdict(int)
+        for s in by_participant[p]:
+            counts[s["gesture_id"]] += 1
+        p_labels.append(max(counts, key=counts.get))
+
+    p_arr = np.array(participants)
+    y_arr = np.array(p_labels)
+
+    # Split off test set
+    sss1 = StratifiedShuffleSplit(
+        n_splits=1, test_size=DATA_SPLITS["test_ratio"], random_state=42)
+    train_val_idx, test_idx = next(sss1.split(p_arr, y_arr))
+
+    # Split train_val into train and val
+    val_frac = DATA_SPLITS["val_ratio"] / (
+        DATA_SPLITS["train_ratio"] + DATA_SPLITS["val_ratio"])
+    sss2 = StratifiedShuffleSplit(
+        n_splits=1, test_size=val_frac, random_state=42)
+    tr_sub, va_sub = next(
+        sss2.split(p_arr[train_val_idx], y_arr[train_val_idx]))
+
+    train_p = set(p_arr[train_val_idx][tr_sub])
+    val_p   = set(p_arr[train_val_idx][va_sub])
+    test_p  = set(p_arr[test_idx])
+
+    return (
+        [s for s in samples if s["participant"] in train_p],
+        [s for s in samples if s["participant"] in val_p],
+        [s for s in samples if s["participant"] in test_p],
+    )
 
 
 # =============================================================================
-# 3. COPY / MOVE FILES
+# 3. FILE TRANSFER
 # =============================================================================
 
-def _transfer(
-    src: Path,
-    dest: Path,
-    copy: bool,
-) -> None:
+def _transfer(src: Path, dest: Path, copy: bool) -> None:
     """Copy or move *src* → *dest*, creating parent directories as needed."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if copy:
@@ -238,9 +361,8 @@ def _transfer(
         shutil.move(str(src), str(dest))
 
 
-def populate_split(
-    participant_list: List[str],
-    samples: Dict[str, List[Tuple[int, Path, Path | None]]],
+def _populate_split(
+    split_samples: List[Dict],
     img_dest: Path,
     lm_dest: Path,
     copy: bool,
@@ -248,42 +370,45 @@ def populate_split(
 ) -> List[dict]:
     """
     Transfer frame images (and optionally landmark JSON files) for every
-    participant in *participant_list* to the destination folders.
+    sample in *split_samples* to the destination folders.
 
-    Returns
-    -------
-    A list of entry dicts suitable for embedding in ``dataset.json``.
+    Uses the same sample-dict format as ``preprocess.py``
+    (``{landmark_path, image_path, gesture_id, participant, session}``).
+
+    Returns a list of entry dicts for embedding in ``dataset.json``.
     Each entry has keys:
-      - ``"image"``    : relative path from output_root
-      - ``"landmark"`` : relative path from output_root  (if include_landmarks)
-      - ``"gesture_id"``, ``"gesture_name"``
+      ``"image"``, ``"gesture_id"``, ``"gesture_name"``,
+      and ``"landmark"`` when *include_landmarks* is ``True``.
     """
     entries = []
 
-    for participant in sorted(participant_list):
-        for gid, frame_path, lm_path in sorted(
-            samples[participant], key=lambda t: (t[0], str(t[1]))
-        ):
-            # Build unique destination filename:
-            # <participant>_<session>_<gesture_id>_<original_name>
-            session = frame_path.parent.parent.name
-            dest_name = f"{participant}_{session}_{gid}_{frame_path.name}"
+    for s in sorted(split_samples, key=lambda x: (x["gesture_id"],
+                                                   str(x["landmark_path"]))):
+        participant = s["participant"]
+        session     = s["session"]
+        gid         = s["gesture_id"]
+        lm_path     = s["landmark_path"]
+        img_path    = s["image_path"]
+
+        entry: dict = {"gesture_id": gid, "gesture_name": GESTURE_NAMES[gid]}
+
+        # ── Frame image ───────────────────────────────────────────────────────
+        if img_path is not None and img_path.exists():
+            dest_name  = f"{participant}_{session}_{gid}_{img_path.name}"
             dest_frame = img_dest / dest_name
-            _transfer(frame_path, dest_frame, copy)
+            _transfer(img_path, dest_frame, copy)
+            entry["image"] = f"./{img_dest.name}/{dest_name}"
+        else:
+            entry["image"] = ""
 
-            entry: dict = {
-                "image":        f"./{img_dest.name}/{dest_name}",
-                "gesture_id":   gid,
-                "gesture_name": GESTURE_NAMES[gid],
-            }
+        # ── Landmark JSON ─────────────────────────────────────────────────────
+        if include_landmarks:
+            lm_dest_name = f"{participant}_{session}_{gid}_{lm_path.name}"
+            dest_lm      = lm_dest / lm_dest_name
+            _transfer(lm_path, dest_lm, copy)
+            entry["landmark"] = f"./{lm_dest.name}/{lm_dest_name}"
 
-            if include_landmarks and lm_path is not None:
-                lm_dest_name = f"{participant}_{session}_{gid}_{lm_path.name}"
-                dest_lm = lm_dest / lm_dest_name
-                _transfer(lm_path, dest_lm, copy)
-                entry["landmark"] = f"./{lm_dest.name}/{lm_dest_name}"
-
-            entries.append(entry)
+        entries.append(entry)
 
     return entries
 
@@ -292,18 +417,21 @@ def populate_split(
 # 4. DATASET JSON
 # =============================================================================
 
-def build_dataset_json(
-    output_root: Path,
+def _build_dataset_json(
     train_entries: List[dict],
     val_entries: List[dict],
     test_entries: List[dict],
-    train_participants: List[str],
-    val_participants: List[str],
-    test_participants: List[str],
+    train_samples: List[Dict],
+    val_samples: List[Dict],
+    test_samples: List[Dict],
 ) -> dict:
     """
     Build and return the ``dataset.json`` metadata dictionary.
     """
+    train_participants = sorted({s["participant"] for s in train_samples})
+    val_participants   = sorted({s["participant"] for s in val_samples})
+    test_participants  = sorted({s["participant"] for s in test_samples})
+
     return {
         "name": "GestureRecognitionSystem",
         "description": (
@@ -311,7 +439,7 @@ def build_dataset_json(
             "structured in AMOS-like format."
         ),
         "reference": "https://github.com/Sudo0xSajal/gesture-recognition-system",
-        "licence": "Dataset license information here",
+        "license": "Dataset license information here",
         "release": "1.0",
         "modality": {
             "0": "RGB"
@@ -323,18 +451,18 @@ def build_dataset_json(
             str(gid): action for gid, action in GESTURE_ACTIONS.items()
         },
         "numClasses": NUM_CLASSES,
-        "numTraining": len(list((output_root / "imagesTr").glob("*"))),
-        "numValidation": len(list((output_root / "imagesVa").glob("*"))),
-        "numTest": len(list((output_root / "imagesTs").glob("*"))),
+        "numTraining":   len(train_entries),
+        "numValidation": len(val_entries),
+        "numTest":       len(test_entries),
         "participantSplit": {
-            "train": sorted(train_participants),
-            "val":   sorted(val_participants),
-            "test":  sorted(test_participants),
+            "train": train_participants,
+            "val":   val_participants,
+            "test":  test_participants,
         },
         "training": [
             {
-                "image":    e["image"],
-                "landmark": e.get("landmark", ""),
+                "image":        e["image"],
+                "landmark":     e.get("landmark", ""),
                 "gesture_id":   e["gesture_id"],
                 "gesture_name": e["gesture_name"],
             }
@@ -342,8 +470,8 @@ def build_dataset_json(
         ],
         "validation": [
             {
-                "image":    e["image"],
-                "landmark": e.get("landmark", ""),
+                "image":        e["image"],
+                "landmark":     e.get("landmark", ""),
                 "gesture_id":   e["gesture_id"],
                 "gesture_name": e["gesture_name"],
             }
@@ -360,51 +488,68 @@ def build_dataset_json(
 # =============================================================================
 
 def structure_dataset(
-    raw_root: Path,
+    root: Path,
     output_root: Path,
     copy: bool = False,
-    seed: int = 42,
 ) -> None:
     """
-    Full structuring pipeline.
+    Full AMOS-like structuring pipeline.
 
-    1. Collect all (gesture_id, frame, landmark) samples from *raw_root*.
-    2. Split participants into train / val / test.
-    3. Create the AMOS-like output directory tree under *output_root*.
-    4. Transfer files into the correct split folder.
-    5. Write ``dataset.json``.
+    Mirrors ``preprocess.preprocess()`` in scanning and splitting strategy,
+    then copies (or moves) files into an AMOS-like output tree and writes
+    ``dataset.json``.
 
     Parameters
     ----------
-    raw_root    : path to ``dataset/raw``
-    output_root : destination root (e.g. ``dataset/structured``)
-    copy        : copy files instead of moving them
-    seed        : random seed for reproducible participant shuffle
+    root        : dataset root — same path passed to ``preprocess.py``
+                  (usually ``RAW_DATASET_PATH = "dataset/raw"``).
+                  The script looks for ``root/raw/`` (collector.py output)
+                  and falls back to a flat ``<root>/<gesture_id>/`` layout.
+    output_root : destination root for the structured dataset.
+    copy        : if ``True``, copy files instead of moving them.
     """
-    # ── 1. Collect ────────────────────────────────────────────────────────────
-    print(f"[structure] Scanning raw dataset at: {raw_root}")
-    samples = collect_samples(raw_root)
+    print(f"\n[structure] root={root}  output={output_root}")
 
-    if not samples:
-        print("[structure] No samples found.  Check that --raw-root points to a "
-              "directory matching the expected layout:\n"
-              "    <raw_root>/<participant>/<session>/<gesture_id>/<files>")
+    if not root.exists():
+        print(f"  [ERROR] Dataset root not found: {root}")
+        print("  Options:")
+        print("    1. Collect a custom webcam dataset:  bash collect.sh -p p001")
+        print(f"   2. Download a dataset and place images under {root}/")
+        print("       organised as:  <gesture_id>/<image>.jpg  "
+              "or  <gesture_name>/<image>.jpg")
         return
 
-    total_frames = sum(len(v) for v in samples.values())
-    print(f"[structure] Found {total_frames} frame(s) across "
-          f"{len(samples)} participant(s).")
+    # ── 1. Scan ───────────────────────────────────────────────────────────────
+    samples = _scan_dataset(root)
+    if not samples:
+        # Try image-only layout (landmark JSONs alongside images)
+        samples = _scan_image_dataset(root)
+    if not samples:
+        print(f"  [ERROR] No samples found in {root}")
+        print("  Options:")
+        print("    1. Collect webcam data:  bash collect.sh -p p001")
+        print(f"   2. Download a dataset to {root}/  organised as:")
+        print("       <gesture_id>/<image>.jpg  or  <gesture_name>/<image>.jpg")
+        print("    3. Run preprocess.py --from-images first to generate landmark "
+              "JSON files, then run this script.")
+        return
 
-    # ── 2. Split ──────────────────────────────────────────────────────────────
-    train_ratio = DATA_SPLITS["train_ratio"]
-    val_ratio   = DATA_SPLITS["val_ratio"]
+    n_participants = len({s["participant"] for s in samples})
+    print(f"  Found {len(samples)} samples  |  {n_participants} participant(s)")
 
-    train_ps, val_ps, test_ps = split_participants(
-        samples, train_ratio, val_ratio, seed
-    )
+    # Class distribution (matches preprocess.py output style)
+    by_class: Dict[int, int] = defaultdict(int)
+    for s in samples:
+        by_class[s["gesture_id"]] += 1
+    print("  Class distribution:")
+    for gid in range(NUM_CLASSES):
+        cnt = by_class.get(gid, 0)
+        bar = "█" * (cnt // 10)
+        print(f"    [{gid:02d}] {GESTURE_NAMES[gid]:22s}: {cnt:4d}  {bar}")
 
-    print(f"[structure] Split → train: {len(train_ps)}, "
-          f"val: {len(val_ps)}, test: {len(test_ps)} participant(s).")
+    # ── 2. Participant-level split ─────────────────────────────────────────────
+    train_s, val_s, test_s = _participant_split(samples)
+    print(f"\n  Split → train={len(train_s)}  val={len(val_s)}  test={len(test_s)}")
 
     # ── 3. Create output directory tree ───────────────────────────────────────
     for sub in ["imagesTr", "landmarksTr",
@@ -413,19 +558,19 @@ def structure_dataset(
         (output_root / sub).mkdir(parents=True, exist_ok=True)
 
     op_label = "Copying" if copy else "Moving"
-    print(f"[structure] {op_label} files to: {output_root}")
+    print(f"\n  {op_label} files to: {output_root}")
 
     # ── 4. Transfer files ─────────────────────────────────────────────────────
-    train_entries = populate_split(
-        train_ps, samples,
+    train_entries = _populate_split(
+        train_s,
         output_root / "imagesTr",
         output_root / "landmarksTr",
         copy=copy,
         include_landmarks=True,
     )
 
-    val_entries = populate_split(
-        val_ps, samples,
+    val_entries = _populate_split(
+        val_s,
         output_root / "imagesVa",
         output_root / "landmarksVa",
         copy=copy,
@@ -433,8 +578,8 @@ def structure_dataset(
     )
 
     # Test split: images only (landmarks withheld, mirroring MnMs convention)
-    test_entries = populate_split(
-        test_ps, samples,
+    test_entries = _populate_split(
+        test_s,
         output_root / "imagesTs",
         output_root / "landmarksTs",
         copy=copy,
@@ -442,10 +587,9 @@ def structure_dataset(
     )
 
     # ── 5. Write dataset.json ─────────────────────────────────────────────────
-    dataset_info = build_dataset_json(
-        output_root,
+    dataset_info = _build_dataset_json(
         train_entries, val_entries, test_entries,
-        train_ps, val_ps, test_ps,
+        train_s, val_s, test_s,
     )
 
     json_path = output_root / "dataset.json"
@@ -453,12 +597,12 @@ def structure_dataset(
         json.dump(dataset_info, f, indent=4)
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print("\n✅  Gesture dataset structuring completed successfully.")
-    print(f"   Structured dataset saved at : {output_root}")
-    print(f"   Training frames             : {dataset_info['numTraining']}")
-    print(f"   Validation frames           : {dataset_info['numValidation']}")
-    print(f"   Test frames                 : {dataset_info['numTest']}")
-    print(f"   dataset.json written to     : {json_path}")
+    print(f"\n[structure] Done — structured dataset saved to {output_root}\n")
+    print("✅  Gesture dataset structuring completed successfully.")
+    print(f"   Training samples   : {dataset_info['numTraining']}")
+    print(f"   Validation samples : {dataset_info['numValidation']}")
+    print(f"   Test samples       : {dataset_info['numTest']}")
+    print(f"   dataset.json       : {json_path}")
 
 
 # =============================================================================
@@ -472,8 +616,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description=textwrap.dedent("""\
             AMOS-like Dataset Structurer for the Gesture Recognition System.
 
-            Splits participants into train / val / test and copies (or moves)
-            their frames + landmark JSON files into:
+            Applies the same scanning and participant-level splitting logic as
+            preprocess.py, then copies (or moves) files into:
 
                 <output_root>/
                 ├── imagesTr/      landmarksTr/
@@ -481,12 +625,24 @@ def _build_parser() -> argparse.ArgumentParser:
                 ├── imagesTs/      landmarksTs/
                 └── dataset.json
         """),
+        epilog=textwrap.dedent("""\
+            Examples
+            --------
+              # Default paths from config.py:
+              python code/data/structure.py
+
+              # Custom paths, keep raw data intact:
+              python code/data/structure.py \\
+                  --root /path/to/dataset/raw \\
+                  --output-root /path/to/dataset/structured \\
+                  --copy
+        """),
     )
     p.add_argument(
-        "--raw-root",
+        "--root",
         default=None,
         metavar="DIR",
-        help=f"Raw dataset root directory (default: {RAW_DATASET_PATH})",
+        help=f"Dataset root directory (default: {RAW_DATASET_PATH})",
     )
     p.add_argument(
         "--output-root",
@@ -502,22 +658,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Copy files instead of moving them (keeps the raw dataset intact)",
     )
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for participant shuffle (default: 42)",
-    )
     return p
 
 
 def main() -> None:
-    args  = _build_parser().parse_args()
-    raw   = Path(args.raw_root)   if args.raw_root    else Path(RAW_DATASET_PATH)
-    out   = Path(args.output_root) if args.output_root else (
-        Path(PREPROCESSED_DATASET_PATH) / "structured"
+    args = _build_parser().parse_args()
+    root = Path(args.root) if args.root else Path(RAW_DATASET_PATH)
+    out  = (
+        Path(args.output_root) if args.output_root
+        else Path(PREPROCESSED_DATASET_PATH) / "structured"
     )
-    structure_dataset(raw, out, copy=args.copy, seed=args.seed)
+    structure_dataset(root, out, copy=args.copy)
 
 
 if __name__ == "__main__":
