@@ -1,0 +1,39 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# PyTest
+.pytest_cache/
+*.pytest_cache
+
+# Logs
+log/
+
+# Model checkpoints & caches
+*.pt
+*.pth
+*.joblib
+*.npz
+*.npy
+
+# MediaPipe model (downloaded at runtime)
+code/data/hand_landmarker.task
+
+# OS
+.DS_Store
+Thumbs.db
