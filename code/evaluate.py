@@ -212,7 +212,8 @@ def evaluate(task: str, model_type: str, checkpoint: Path,
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("-t", "--task",       required=True, choices=["hgrd","custom"])
+    ap.add_argument("-t", "--task",       default="gesture",
+                    help="Experiment task label (used in log directory name)")
     ap.add_argument("-m", "--model",      required=True,
                     choices=["cnn","mobilenet","lstm","svm"])
     ap.add_argument("-c", "--checkpoint", required=True, type=Path)

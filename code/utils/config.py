@@ -57,11 +57,6 @@ TRAIN_SPLIT_DIR = SPLITS_DIR / "train"
 VAL_SPLIT_DIR   = SPLITS_DIR / "val"
 TEST_SPLIT_DIR  = SPLITS_DIR / "test"
 
-DATASETS = {
-    "hgrd":   Path(os.environ.get("HGRD_ROOT",  PROJECT_ROOT / "hand-gesture-recognition-dataset")),
-    "custom": Path(os.environ.get("CUSTOM_ROOT", PROJECT_ROOT / "custom_dataset")),
-}
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. GESTURE VOCABULARY  (exact 25 gestures from Ma'am's Table)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,15 +222,11 @@ INFERENCE_CONFIG = {
 # 9. HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_dataset_root(task: str) -> Path:
-    if task not in DATASETS:
-        raise ValueError(f"Unknown task '{task}'. Choose: {list(DATASETS)}")
-    return DATASETS[task]
-
-
-def get_split_file(task: str, split: str) -> Path:
-    """Return path to <dataset>/splits/<split>.txt"""
-    return get_dataset_root(task) / "splits" / f"{split}.txt"
+def get_split_file(task: str = None, split: str = "") -> Path:
+    """Return path to SPLITS_DIR/<split>.txt"""
+    if not split:
+        raise ValueError("split must be one of: 'train', 'val', 'test'")
+    return SPLITS_DIR / f"{split}.txt"
 
 
 def get_log_dir(exp_name: str, model: str, task: str) -> Path:

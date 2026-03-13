@@ -684,7 +684,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="Train LSTM/RNN gesture model — fully supervised"
     )
-    ap.add_argument("-t", "--task",      required=True, choices=["hgrd", "custom"])
+    ap.add_argument("-t", "--task",      default="gesture",
+                    help="Experiment task label (used in log directory name)")
     ap.add_argument("-e", "--exp-name",  default="exp")
     ap.add_argument("-s", "--seed",      type=int,   default=42)
     ap.add_argument("-c", "--gpu",       type=int,   default=0)

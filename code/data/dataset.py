@@ -36,7 +36,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from utils.config import (
-    get_dataset_root, get_split_file,
+    get_split_file, PREPROCESSED_DATASET_PATH,
     NUM_CLASSES, TRAINING_CONFIG, MODEL_CONFIG,
 )
 
@@ -249,7 +249,7 @@ def load_svm_data(task: str, split: str) -> Tuple[np.ndarray, np.ndarray]:
 
     Parameters
     ----------
-    task  : 'hgrd' | 'custom'
+    task  : unused, kept for backward compatibility
     split : 'train' | 'val' | 'test'
 
     Returns
@@ -257,7 +257,7 @@ def load_svm_data(task: str, split: str) -> Tuple[np.ndarray, np.ndarray]:
     X : (N, 63) float32 — normalised landmark feature vectors
     y : (N,)    int32   — gesture class labels
     """
-    root       = get_dataset_root(task)
+    root       = PREPROCESSED_DATASET_PATH
     cache_path = root / "splits" / f"{split}_features.npz"
 
     if cache_path.exists():
@@ -311,7 +311,7 @@ def create_dataloaders(
 
     Parameters
     ----------
-    task       : 'hgrd' | 'custom'
+    task       : unused, kept for backward compatibility
     model_type : 'cnn' | 'lstm'
     batch_size : overrides TRAINING_CONFIG if given
     num_workers: overrides TRAINING_CONFIG if given

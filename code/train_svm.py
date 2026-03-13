@@ -35,15 +35,15 @@ How SVM works:
 
 Run
 ---
-    python code/train_svm.py --task hgrd --exp-name exp1
-    python code/train_svm.py --task hgrd --exp-name exp1 --kernel linear
-    python code/train_svm.py --task hgrd --exp-name exp1 --C 50 --gamma 0.001
+    python code/train_svm.py --exp-name exp1
+    python code/train_svm.py --exp-name exp1 --kernel linear
+    python code/train_svm.py --exp-name exp1 --C 50 --gamma 0.001
 
 Or via shell:
-    bash train_svm.sh -t hgrd -e exp1 -k rbf -C 10
+    bash train_svm.sh -e exp1 -k rbf -C 10
 
 Output saved to:
-    log/exp1_svm_hgrd/
+    log/exp1_svm_gesture/
         svm_model.joblib        <- load this for inference
         summary.json            <- accuracy numbers
         eval_results.json       <- per-class accuracy
@@ -68,7 +68,8 @@ from sklearn.metrics import classification_report, accuracy_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils.config import (
-    get_dataset_root, get_split_file, get_log_dir,
+    get_split_file, get_log_dir,
+    PREPROCESSED_DATASET_PATH,
     GESTURE_NAMES, NUM_CLASSES,
 )
 
@@ -93,7 +94,7 @@ def load_landmark_features(task: str, split: str) -> tuple:
     """
     import json as json_mod
 
-    root       = get_dataset_root(task)
+    root       = PREPROCESSED_DATASET_PATH
     cache_path = root / "splits" / f"{split}_features.npz"
 
     if cache_path.exists():
@@ -372,7 +373,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="Train SVM gesture classifier — fully supervised"
     )
-    ap.add_argument("-t", "--task",      required=True, choices=["hgrd", "custom"])
+    ap.add_argument("-t", "--task",      default="gesture",
+                    help="Experiment task label (used in log directory name)")
     ap.add_argument("-e", "--exp-name",  default="exp")
     ap.add_argument("-k", "--kernel",    default="rbf",
                     choices=["rbf", "linear", "poly"],
