@@ -28,6 +28,35 @@ from pathlib import Path
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parents[2]))
 LOG_ROOT     = Path(os.environ.get("LOG_ROOT",     PROJECT_ROOT / "log"))
 
+
+def _resolve_path(path) -> Path:
+    """Return *path* as an absolute Path.
+
+    Relative paths are resolved against PROJECT_ROOT so the config works
+    regardless of the working directory from which scripts are executed.
+    Absolute paths are returned unchanged.
+    """
+    path = Path(path)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATASET PATHS  — edit ONLY these two variables to match your environment.
+#
+# Both accept absolute or relative paths.
+# Relative paths are resolved from the project root automatically.
+# Directories are NOT created here; the preprocessing pipeline creates them.
+# ─────────────────────────────────────────────────────────────────────────────
+RAW_DATASET_PATH          = _resolve_path("dataset/raw")
+PREPROCESSED_DATASET_PATH = _resolve_path("dataset/preprocessed")
+
+# Derived paths — computed automatically from PREPROCESSED_DATASET_PATH.
+# Do NOT edit these directly; change PREPROCESSED_DATASET_PATH above instead.
+SPLITS_DIR      = PREPROCESSED_DATASET_PATH / "splits"
+TRAIN_SPLIT_DIR = SPLITS_DIR / "train"
+VAL_SPLIT_DIR   = SPLITS_DIR / "val"
+TEST_SPLIT_DIR  = SPLITS_DIR / "test"
+
 DATASETS = {
     "hgrd":   Path(os.environ.get("HGRD_ROOT",  PROJECT_ROOT / "hand-gesture-recognition-dataset")),
     "custom": Path(os.environ.get("CUSTOM_ROOT", PROJECT_ROOT / "custom_dataset")),
